@@ -1,5 +1,6 @@
 package com.haenu.springbootinit.controller;
 
+import cn.hutool.core.io.FileUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.google.gson.Gson;
@@ -13,6 +14,7 @@ import com.haenu.springbootinit.constant.UserConstant;
 import com.haenu.springbootinit.exception.BusinessException;
 import com.haenu.springbootinit.exception.ThrowUtils;
 import com.haenu.springbootinit.manager.AiManager;
+import com.haenu.springbootinit.manager.RedisLimiterManager;
 import com.haenu.springbootinit.model.dto.chart.*;
 import com.haenu.springbootinit.model.entity.Chart;
 import com.haenu.springbootinit.model.entity.User;
@@ -30,6 +32,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * 图表接口
@@ -47,6 +51,9 @@ public class ChartController {
 
     @Resource
     private AiManager aiManager;
+
+    @Resource
+    private RedisLimiterManager redisLimiterManager;
 
     // region 增删改查
 
@@ -261,21 +268,29 @@ public class ChartController {
         ThrowUtils.throwIf(StringUtils.isBlank(goal), ErrorCode.PARAMS_ERROR, "目标为空");
         // 如果名称不为空，并且名称长度大于100，就抛出异常，并给出提示
         ThrowUtils.throwIf(StringUtils.isNotBlank(name) && name.length() > 100, ErrorCode.PARAMS_ERROR, "名称过长");
+
+        //校验文件
+        vaildFile(multipartFile);
+
         // 通过response对象拿到用户id(必须登录才能使用)
         User loginUser = userService.getLoginUser(request);
 
+        //由于限流操作可能会抛出异常，因此当请求到达时，如果无法获取到令牌，则将抛出异常并终止请求；反之，如果成功获取到令牌，
+        // 则请求可以正常继续执行，此时不需要进行其他任何操作。
+        redisLimiterManager.doRateLimit("genChartByAi_" + loginUser.getId());
+
         // 指定一个模型id(把id写死，也可以定义成一个常量)
         long biModelId = 1659171950288818178L;
-    /*
-    * 用户的输入(参考)
-      分析需求：
-      分析网站用户的增长情况
-      原始数据：
-      日期,用户数
-      1号,10
-      2号,20
-      3号,30
-    * */
+        /*
+         * 用户的输入(参考)
+           分析需求：
+           分析网站用户的增长情况
+           原始数据：
+           日期,用户数
+           1号,10
+           2号,20
+           3号,30
+        * */
 
         // 构造用户输入
         StringBuilder userInput = new StringBuilder();
@@ -295,32 +310,80 @@ public class ChartController {
         userInput.append(csvData).append("\n");
 
         // 拿到返回结果
-        String result = aiManager.doChat(biModelId,userInput.toString());
+        String result = aiManager.doChat(biModelId, userInput.toString());
         // 对返回结果做拆分,按照5个中括号进行拆分
         String[] splits = result.split("【【【【【");
         // 拆分之后还要进行校验
         if (splits.length < 3) {
-            throw new BusinessException(ErrorCode.SYSTEM_ERROR,"AI 生成错误");
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "AI 生成错误");
         }
-
+        // 如果是正确就提取图表代码(删除多余的空格和换行)
         String genChart = splits[1].trim();
+        // 如果是正确的就提取结论(删除多余的空格和换行)
         String genResult = splits[2].trim();
+
         // 插入到数据库
         Chart chart = new Chart();
+        // 图表名称
         chart.setName(name);
+        // 分析目标
         chart.setGoal(goal);
+        // 图表数据
         chart.setChartData(csvData);
+        // 图表类型
         chart.setChartType(chartType);
+        // 图表代码
         chart.setGenChart(genChart);
+        // 结论
         chart.setGenResult(genResult);
+        // 谁登录的，就是谁创建的
         chart.setUserId(loginUser.getId());
+        // 如果为真，保存图表到数据库中
         boolean saveResult = chartService.save(chart);
+        // 如果为假，抛出异常，并提示"图表保存失败"
         ThrowUtils.throwIf(!saveResult, ErrorCode.SYSTEM_ERROR, "图表保存失败");
+
+        // 最后封装到BiResponse里
         BiResponse biResponse = new BiResponse();
+        // 设置一下拿到的结果
         biResponse.setGenChart(genChart);
         biResponse.setGenResult(genResult);
+        // 把新生成的图表id拿到
         biResponse.setChartId(chart.getId());
+        // 最后，返回biResponse
         return ResultUtils.success(biResponse);
     }
 
+    private static void vaildFile(MultipartFile multipartFile) {
+        /**
+         * 校验文件
+         *
+         * 首先,拿到用户请求的文件;
+         * 取到原始文件大小
+         */
+        long size = multipartFile.getSize();
+        // 取到原始文件名
+        String originalFilename = multipartFile.getOriginalFilename();
+
+        /**
+         * 校验文件大小
+         *
+         * 定义一个常量表示1MB;
+         * 一兆(1MB) = 1024*1024字节(Byte) = 2的20次方字节
+         */
+        final long ONE_MB = 1024 * 1024L;
+        // 如果文件大小,大于一兆,就抛出异常,并提示文件超过1M
+        ThrowUtils.throwIf(size > ONE_MB, ErrorCode.PARAMS_ERROR, "文件超过 1M");
+
+        /**
+         * 校验文件后缀(一般文件是aaa.png,我们要取到.<点>后面的内容)
+         *
+         * 利用FileUtil工具类中的getSuffix方法获取文件后缀名(例如:aaa.png,suffix应该保存为png)
+         */
+        String suffix = FileUtil.getSuffix(originalFilename);
+        // 定义合法的后缀列表
+        final List<String> validFileSuffixList = Arrays.asList("png", "jpg", "svg", "webp", "jpeg");
+        // 如果suffix的后缀不在List的范围内,抛出异常,并提示'文件后缀非法'
+        ThrowUtils.throwIf(!validFileSuffixList.contains(suffix), ErrorCode.PARAMS_ERROR, "文件后缀非法");
+    }
 }
